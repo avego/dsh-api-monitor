@@ -4,6 +4,13 @@
   "private": true,
   "type": "module",
   "description": "Right-Sidebar API monitor: every outbound API request with its full headers and JSON body.",
+  "license": "MIT",
+  "author": "Alexander Tishov (https://avego.org)",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/avego/dsh-api-monitor.git"
+  },
+  "homepage": "https://github.com/avego/dsh-api-monitor#readme",
   "exports": {
     ".": "./index.js",
     "./client": "./client.js",
@@ -16,7 +23,10 @@
     "cordis.patch.yml",
     "locale/*.json",
     "docs",
-    "icon.svg"
+    "icon.svg",
+    "LICENSE",
+    "README.md",
+    "README.ru.md"
   ],
   "dsh": {
     "bundle": {

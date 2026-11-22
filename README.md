@@ -1,1 +1,198 @@
-# dsh-api-monitor
+# Api monitor for [DSH]
+
+**English** · [Русский](README.ru.md)
+
+A [DSH] plugin that shows every outbound API request the Host makes — the URL, the method, **all** headers, the raw JSON body and the response — in a tab of the right sidebar.
+
+The Models and session pages tell you *that* a request happened. This plugin shows you exactly *what* went over the wire, including the `Authorization` header and the full prompt payload that provider-side views leave out.
+
+> Requires a Web-GUI deployment of [DSH] (Desktop app or `dsh web`). Plain ESM, no build step, no dependencies.
+
+## Where it appears
+
+- **Right sidebar → Start page**: an **Api monitor** card, placed after *Browser*. Click it to open the monitor as a tab in the same panel.
+- **Left sidebar, bottom**: a pulse button next to Settings. It opens the same tab from anywhere.
+
+The tab is a master/detail inspector:
+
+| Tab | Shows |
+| --- | --- |
+| **Request JSON** | The whole exchange as one document: URL, method, headers, body, response, error |
+| **Headers** | Every request header as a table |
+| **cURL** | A ready-to-run command that reproduces the call |
+| **Response** | Status, timing, response headers and the first part of the body |
+
+Above the detail pane: live filter, pause, export to `.json`, and clear.
+
+## Install
+
+The plugin is a directory bundle: plain ESM, no build step, no dependencies.
+
+```sh
+git clone https://github.com/avego/dsh-api-monitor.git
+```
+
+Then either:
+
+- **UI**: Settings (gear at the sidebar foot) → **Plugins** → **Add plugin** → pick the cloned folder;
+- **or an agent**: `plugin_manager` with `action: install_bundle` and `target` set to the absolute path.
+
+Requirements: a deployment that serves the Web GUI (the Desktop app or `dsh web`) — the Host half needs the `webServer` service. Headless and SDK profiles have no Web server and no sidebar, so there is nowhere for this plugin to run.
+
+Changes apply to the whole profile and survive restarts. The package keeps a `@local/` scope name: it is installed from a directory, never from a registry, so there is no publish step and no other install channel to keep in sync.
+
+## What gets captured
+
+The Host half instruments two entry points of the process:
+
+1. `globalThis.fetch` — what every HTTP SDK in the tree goes through (OpenAI-, Anthropic- and Gemini-compatible clients, `fetch`-based providers);
+2. `node:http` / `node:https` `request` — code paths that build requests by hand.
+
+Each call becomes one record. A record is written when the request starts and updated when the response headers arrive and again when the preview is read, so a request still in flight is visible as `pending`.
+
+A record looks like this (trimmed, token redacted):
+
+```json
+{
+  "id": "req_mwrn3x1k_2",
+  "timestamp": "2026-11-22T08:25:41.045Z",
+  "host": "plusvibeapi.ru",
+  "url": "https://plusvibeapi.ru/v1/chat/completions",
+  "method": "POST",
+  "headers": {
+    "accept": "application/json",
+    "authorization": "Bearer sk-…",
+    "content-type": "application/json",
+    "user-agent": "deepseek-harness/0.2.2-rc.3",
+    "x-stainless-arch": "x64",
+    "x-stainless-lang": "js",
+    "x-stainless-runtime": "node"
+  },
+  "body": {
+    "model": "deepseek-v4.1-flash",
+    "messages": [
+      { "role": "system", "content": "You are an AI agent powered by [DSH]…" },
+      { "role": "user", "content": "проведи анализ проекта" }
+    ]
+  },
+  "durationMs": 4688,
+  "pending": false,
+  "responseStatus": 200,
+  "responseStatusText": "OK",
+  "responseHeaders": { "content-type": "text/event-stream; charset=utf-8" },
+  "responsePreview": { "…": "first 64 KiB of the response" },
+  "responseBytes": ">=65700",
+  "error": null
+}
+```
+
+### Record fields
+
+| Field | Meaning |
+| --- | --- |
+| `id` | `req_<base36 time>_<sequence>` |
+| `timestamp` | ISO 8601, when the call was made |
+| `host` | Host name of the URL, for grouping |
+| `url` | Full URL, query string included |
+| `method` | Upper-case HTTP method |
+| `headers` | Request headers: lower-cased names, one string per value |
+| `body` | Parsed JSON when the body is JSON, raw text otherwise, `null` when empty |
+| `durationMs` | Time until the response headers arrived |
+| `pending` | `true` while the call is still in flight |
+| `responseStatus` … `responseStatusText` | Response status |
+| `responseHeaders` | Response headers, same shape as `headers` |
+| `responsePreview` | First 64 KiB of the response, parsed as JSON when it is JSON |
+| `responseBytes` | Body size, or `>=N` when the preview was capped |
+| `error` | Transport failure, or the connection closing before a response |
+
+Bodies are parsed rather than stored as strings, so the detail view and the export keep the original JSON structure. A body larger than 8 MiB is stored as `{ "truncated": true, "characters": N, "preview": "…" }`.
+
+## HTTP routes
+
+The Client half reads the buffer over three routes on the same Web server that serves the GUI, so you can also script against them:
+
+| Route | Method | Answer |
+| --- | --- | --- |
+| `/api/api-monitor/requests` | `GET` | `{ ok, count, requests: [...] }`, newest first |
+| `/api/api-monitor/requests` | `POST`, `DELETE` | Clears the buffer, `{ ok: true }` |
+| `/api/api-monitor/clear` | `POST` | Clears the buffer, `{ ok: true }` |
+| `/api/api-monitor/events` | `GET` | `text/event-stream`: `init`, `new-request`, `update-request`, `cleared` |
+
+```sh
+curl -s http://127.0.0.1:<port>/api/api-monitor/requests | jq '.requests[0].headers'
+```
+
+These routes live outside the Remote gateway, so they carry no session token of their own. They therefore answer **loopback requests only** (`127.0.0.0/8`, `::1`, `::ffff:127.*`) and refuse everything else with `403`. Any local process can still read them — see [Security](#security).
+
+## Configuration
+
+The bundle's `cordis.patch.yml` carries the defaults:
+
+```yaml
+- insert:
+    - id: api-monitor
+      name: '@local/dsh-api-monitor'
+      config:
+        maxEntries: 200          # default 100, capped at 2000
+        maxTotalChars: 67108864  # default 48 MiB, capped at 512 MiB
+```
+
+- `maxEntries` — how many requests stay in the buffer.
+- `maxTotalChars` — the shared budget for stored bodies and previews. When it is exceeded, the oldest records are dropped, so a few huge prompts cannot balloon the process.
+
+Editing the bundle's own file works for a trial, but `git pull` may overwrite it. To keep a value, override the same `api-monitor` row in your **profile's** patch layer instead — that layer is yours and survives upgrades.
+
+## How it works
+
+**Host half** (`index.js`) wraps `globalThis.fetch` and the `node:http`/`node:https` `request` entry points, normalizes each call into a record, and keeps a bounded in-memory ring buffer. The wrappers are transparent: the request is forwarded unchanged, the original response object is returned to the caller, and a response body is only peeked at through `Response.clone()`, capped and then cancelled. Failing to capture never fails the call.
+
+**Client half** (`client.js`) is a browser module that registers a right-sidebar tab type (`api-monitor`) with a guide card, the tab body, the tab title, and one rail button at the sidebar foot. It loads the buffer over the routes above and follows new calls over SSE, with a 2.5 s poll as a fallback. It renders with the host theme tokens and its own locale namespace (English and Russian), and it unregisters everything on unload.
+
+## Limitations
+
+- **Host process only.** It instruments the DSH Host, not the machine: traffic from bash, terminals and other subprocesses is not visible. Use a real proxy for that.
+- **Call-time `fetch` only.** A library that captured `fetch` before the plugin loaded (`const f = globalThis.fetch` at import time) keeps bypassing the hook.
+- **Not every client.** Code that skips both hooks — `undici.request()`, native HTTP/2 sessions, raw sockets, `node-fetch`'s internal paths — is invisible.
+- **Streamed request bodies** are not read: draining a `ReadableStream` would consume the caller's body.
+- **The response preview is 64 KiB** and is the *beginning* of the body. For SSE streams that means the opening events, not the whole answer.
+- **Memory only.** Nothing is written to disk, and a restart starts empty.
+- **The `Api monitor` card sits after `Browser`**, not below *More tools*: the sidebar always renders the *More* block last, and card order cannot move it.
+
+## Security
+
+Captured records contain secrets. The `authorization` header holds your API key in clear, and the body holds the entire prompt — code, credentials, anything you typed.
+
+- Nothing is sent anywhere; the plugin has no telemetry and no outbound calls of its own.
+- The routes answer loopback only and are not otherwise authenticated, which means **any local process** can read the buffer while DSH runs.
+- **Export writes secrets to disk.** Keep exported files out of repositories, issue trackers and screenshots.
+- Run **Clear** when you are done, and treat the buffer as a credential store, not a log.
+
+## Development
+
+No build, no bundler, no dependencies — edit the files and reload.
+
+```sh
+node --check index.js
+node --check client.js
+```
+
+To load a change: toggle the plugin row in **Plugins** off and on (this loads a fresh module generation), or restart DSH. A Client-half change also needs the page reloaded.
+
+## Files
+
+| File | Role |
+| --- | --- |
+| `package.json` | Bundle manifest: `dsh.bundle.patch`, `dsh.client` (`platform: web`, slot prerequisites) |
+| `cordis.patch.yml` | The Loader patch that inserts the plugin row and its config |
+| `index.js` | Host half: interception, buffer, routes |
+| `client.js` | Client half: tab type, tab body, tab title, rail button, copy |
+| `locale/en.json`, `locale/ru.json` | Plugin Manager title, description and detail document |
+| `docs/DETAIL.md` | The detail page shown in Plugin Manager (English and Russian) |
+| `icon.svg` | Plugin icon |
+| `LICENSE` | MIT license text |
+
+## License
+
+[MIT](LICENSE) © 2026 [Alexander Tishov](https://avego.org)
+
+You may use, modify and redistribute this plugin, including commercially, as long as the copyright notice and the permission notice stay with it. The software comes with no warranty.

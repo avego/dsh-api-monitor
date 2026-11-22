@@ -8,6 +8,10 @@ The Models and session pages tell you *that* a request happened. This plugin sho
 
 > Requires a Web-GUI deployment of [DSH] (Desktop app or `dsh web`). Plain ESM, no build step, no dependencies.
 
+| Start page card | Request list | Request JSON |
+| --- | --- | --- |
+| ![Api monitor card on the Start page](docs/shots/1-start-card.png) | ![Captured requests with status and timing](docs/shots/2-request-list.png) | ![Full request JSON with headers](docs/shots/3-request-json.png) |
+
 ## Where it appears
 
 - **Right sidebar → Start page**: an **Api monitor** card, placed after *Browser*. Click it to open the monitor as a tab in the same panel.
@@ -40,20 +44,26 @@ Every tab has the same search box: type to highlight all matches in yellow, `Ent
 
 ## Install
 
-The plugin is a directory bundle: plain ESM, no build step, no dependencies.
+Straight from the repository — no build step, no dependencies, so pnpm never asks to run install scripts:
+
+```sh
+dsh plugin add github:avego/dsh-api-monitor
+```
+
+On a profile other than the default, name it: `dsh plugin --profile <profile> add github:avego/dsh-api-monitor`, then restart that host.
+
+Or from a local checkout:
 
 ```sh
 git clone https://github.com/avego/dsh-api-monitor.git
 ```
-
-Then either:
 
 - **UI**: Settings (gear at the sidebar foot) → **Plugins** → **Add plugin** → pick the cloned folder;
 - **or an agent**: `plugin_manager` with `action: install_bundle` and `target` set to the absolute path.
 
 Requirements: a deployment that serves the Web GUI (the Desktop app or `dsh web`) — the Host half needs the `webServer` service. Headless and SDK profiles have no Web server and no sidebar, so there is nowhere for this plugin to run.
 
-Changes apply to the whole profile and survive restarts. The package keeps a `@local/` scope name: it is installed from a directory, never from a registry, so there is no publish step and no other install channel to keep in sync.
+Changes apply to the whole profile and survive restarts.
 
 ## What gets captured
 
@@ -148,7 +158,7 @@ The bundle's `cordis.patch.yml` carries the defaults:
 ```yaml
 - insert:
     - id: api-monitor
-      name: '@local/dsh-api-monitor'
+      name: dsh-api-monitor
       config:
         maxEntries: 200          # default 100, capped at 2000
         maxTotalChars: 67108864  # default 48 MiB, capped at 512 MiB
@@ -206,7 +216,9 @@ To load a change: toggle the plugin row in **Plugins** off and on (this loads a 
 | `client.js` | Client half: tab type, tab body, tab title, rail button, copy |
 | `locale/en.json`, `locale/ru.json` | Plugin Manager title, description and detail document |
 | `docs/DETAIL.md` | The detail page shown in Plugin Manager (English and Russian) |
-| `icon.svg` | Plugin icon |
+| `icon.svg` | Plugin icon, used inside DSH |
+| `icon.png` | 180×180 raster icon for the plugin catalog storefront |
+| `contrib/` | The entry and instructions for listing this plugin in the community catalog |
 | `LICENSE` | MIT license text |
 
 ## License

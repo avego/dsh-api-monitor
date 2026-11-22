@@ -12,7 +12,7 @@
  * decides how to show it and where to highlight a search hit.
  */
 window.__ModuleLoader__.load({
-  id: '@local/dsh-api-monitor',
+  id: 'dsh-api-monitor',
   factory(require) {
     const React = require('react')
     const h = React.createElement
@@ -20,7 +20,7 @@ window.__ModuleLoader__.load({
     /** Tab kind the guide card opens and the body is dispatched under. */
     const KIND = 'api-monitor'
     /** Implementation identity: the tab type id and the body/title slot key. */
-    const ID = '@local/dsh-api-monitor'
+    const ID = 'dsh-api-monitor'
     /** Copy namespace registered in the Client locale service. */
     const NS = 'apiMonitor'
     /** Host routes owned by the Host half. */

@@ -1,9 +1,8 @@
 {
-  "name": "@local/dsh-api-monitor",
+  "name": "dsh-api-monitor",
   "version": "1.0.0",
-  "private": true,
   "type": "module",
-  "description": "Right-Sidebar API monitor: every outbound API request with its full headers and JSON body.",
+  "description": "Inspects the DSH Host's outbound API calls in a right-sidebar tab: URL, method, every request header, JSON body and response, with streamed replies assembled into readable text.",
   "license": "MIT",
   "author": "Alexander Tishov (https://avego.org)",
   "repository": {
@@ -11,6 +10,20 @@
     "url": "git+https://github.com/avego/dsh-api-monitor.git"
   },
   "homepage": "https://github.com/avego/dsh-api-monitor#readme",
+  "bugs": {
+    "url": "https://github.com/avego/dsh-api-monitor/issues"
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "api",
+    "monitor",
+    "inspector",
+    "http",
+    "headers",
+    "debugging"
+  ],
   "exports": {
     ".": "./index.js",
     "./client": "./client.js",
@@ -24,6 +37,8 @@
     "locale/*.json",
     "docs",
     "icon.svg",
+    "icon.png",
+    "screenshots.json",
     "LICENSE",
     "README.md",
     "README.ru.md"

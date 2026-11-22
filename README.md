@@ -18,11 +18,25 @@ The tab is a master/detail inspector:
 | Tab | Shows |
 | --- | --- |
 | **Request JSON** | The whole exchange as one document: URL, method, headers, body, response, error |
-| **Headers** | Every request header as a table |
+| **Headers** | Request and response headers as tables |
 | **cURL** | A ready-to-run command that reproduces the call |
-| **Response** | Status, timing, response headers and the first part of the body |
+| **Response** | The **assembled answer**, with the raw stream one click away |
 
 Above the detail pane: live filter, pause, export to `.json`, and clear.
+
+### Reading a streamed answer
+
+A streaming provider answers with hundreds of small SSE frames, which is unusable raw. The Host folds those frames back into the answer the model actually produced, so the **Response** tab opens on readable text:
+
+- the deltas are concatenated in order, including Anthropic's typed events and Gemini's `candidates` shape;
+- *reasoning* text is kept apart and collapsed under **Reasoning**;
+- tool calls are merged from their fragments and listed under **tool calls**;
+- the header line shows status, duration, model, `finish` reason, token usage and how many frames were folded;
+- **Raw stream** switches to the original frames, and **Assembled** switches back.
+
+### Search
+
+Every tab has the same search box: type to highlight all matches in yellow, `Enter` / `Shift+Enter` (or the ‹ › buttons) to step through them, `Esc` to clear. The box counts hits as `3/17` and scrolls the current one into view. The search covers what the tab shows — the request JSON, both header tables, the cURL command, the assembled answer and its reasoning (and the raw stream when that view is active).
 
 ## Install
 
@@ -101,8 +115,11 @@ A record looks like this (trimmed, token redacted):
 | `pending` | `true` while the call is still in flight |
 | `responseStatus` … `responseStatusText` | Response status |
 | `responseHeaders` | Response headers, same shape as `headers` |
-| `responsePreview` | First 64 KiB of the response, parsed as JSON when it is JSON |
-| `responseBytes` | Body size, or `>=N` when the preview was capped |
+| `responsePreview` | The beginning of the raw response, up to 256 KiB, parsed as JSON when it is JSON |
+| `responsePreviewTruncated` | `true` when the raw preview was cut at that limit |
+| `responseBytes` | How many bytes of the response were read |
+| `responseIncomplete` | `true` when the read stopped at the capture ceiling, so the answer may be cut short |
+| `responseAssembled` | The streamed answer folded into text: `kind`, `text`, `reasoning`, `model`, `finishReason`, `usage`, `toolCalls`, `frames`, `done`, `incomplete` |
 | `error` | Transport failure, or the connection closing before a response |
 
 Bodies are parsed rather than stored as strings, so the detail view and the export keep the original JSON structure. A body larger than 8 MiB is stored as `{ "truncated": true, "characters": N, "preview": "…" }`.
@@ -144,9 +161,9 @@ Editing the bundle's own file works for a trial, but `git pull` may overwrite it
 
 ## How it works
 
-**Host half** (`index.js`) wraps `globalThis.fetch` and the `node:http`/`node:https` `request` entry points, normalizes each call into a record, and keeps a bounded in-memory ring buffer. The wrappers are transparent: the request is forwarded unchanged, the original response object is returned to the caller, and a response body is only peeked at through `Response.clone()`, capped and then cancelled. Failing to capture never fails the call.
+**Host half** (`index.js`) wraps `globalThis.fetch` and the `node:http`/`node:https` `request` entry points, normalizes each call into a record, and keeps a bounded in-memory ring buffer. The wrappers are transparent: the request is forwarded unchanged, the original response object is returned to the caller, and a response body is only read through `Response.clone()`, bounded and then cancelled. Failing to capture never fails the call. Assembly happens here too, at read time, so the Client receives finished text instead of frames.
 
-**Client half** (`client.js`) is a browser module that registers a right-sidebar tab type (`api-monitor`) with a guide card, the tab body, the tab title, and one rail button at the sidebar foot. It loads the buffer over the routes above and follows new calls over SSE, with a 2.5 s poll as a fallback. It renders with the host theme tokens and its own locale namespace (English and Russian), and it unregisters everything on unload.
+**Client half** (`client.js`) is a browser module that registers a right-sidebar tab type (`api-monitor`) with a guide card, the tab body, the tab title, and one rail button at the sidebar foot. It loads the buffer over the routes above and follows new calls over SSE, with a 2.5 s poll as a fallback. It renders with the host theme tokens, keeps its copy in its own locale namespace (English and Russian), and unregisters everything on unload.
 
 ## Limitations
 
@@ -154,7 +171,8 @@ Editing the bundle's own file works for a trial, but `git pull` may overwrite it
 - **Call-time `fetch` only.** A library that captured `fetch` before the plugin loaded (`const f = globalThis.fetch` at import time) keeps bypassing the hook.
 - **Not every client.** Code that skips both hooks — `undici.request()`, native HTTP/2 sessions, raw sockets, `node-fetch`'s internal paths — is invisible.
 - **Streamed request bodies** are not read: draining a `ReadableStream` would consume the caller's body.
-- **The response preview is 64 KiB** and is the *beginning* of the body. For SSE streams that means the opening events, not the whole answer.
+- **Assembly covers the common shapes.** Chat-completion chunks ([OI]), Gemini `candidates`, Anthropic typed events and the Responses events are folded; an unusual provider stream still shows its raw frames, and its text may stay empty.
+- **The raw preview is 256 KiB**, and the assembled answer is read up to 4 MiB of stream. Past that the record is marked `responseIncomplete`, the answer stops where the capture stopped, and the UI says so.
 - **Memory only.** Nothing is written to disk, and a restart starts empty.
 - **The `Api monitor` card sits after `Browser`**, not below *More tools*: the sidebar always renders the *More* block last, and card order cannot move it.
 

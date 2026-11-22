@@ -3,11 +3,13 @@
  *
  * Three contributions:
  *   1. a right-Sidebar tab type `api-monitor` with a guide card, so the Start
- *      page shows an "API monitor" capsule that opens the monitor in place;
+ *      page shows an "Api monitor" capsule that opens the monitor in place;
  *   2. the tab body, a master/detail inspector over the Host's captured calls;
  *   3. a rail button at the sidebar foot that opens the same tab.
  *
  * The data comes from the Host half's routes under `/api/api-monitor/*`.
+ * The Host folds a streamed answer back into readable text; this half only
+ * decides how to show it and where to highlight a search hit.
  */
 window.__ModuleLoader__.load({
   id: '@local/dsh-api-monitor',
@@ -24,6 +26,8 @@ window.__ModuleLoader__.load({
     /** Host routes owned by the Host half. */
     const ROUTE_LIST = '/api/api-monitor/requests'
     const ROUTE_CLEAR = '/api/api-monitor/clear'
+    /** Highlight ceiling: past this many hits the pane stays readable. */
+    const MAX_HITS = 2000
 
     const COPY = {
       en: {
@@ -38,17 +42,30 @@ window.__ModuleLoader__.load({
         'action.copy': 'Copy',
         'action.copied': 'Copied',
         'action.back': 'Back',
-        'action.refresh': 'Refresh',
+        'action.prev': 'Previous match',
+        'action.next': 'Next match',
         'filter.placeholder': 'Filter by URL, method, or header',
+        'search.placeholder': 'Search in this tab',
+        'search.none': 'No matches',
         'tab.request': 'Request JSON',
         'tab.headers': 'Headers',
         'tab.curl': 'cURL',
         'tab.response': 'Response',
+        'view.assembled': 'Assembled',
+        'view.raw': 'Raw stream',
+        'label.reasoning': 'Reasoning',
+        'label.usage': 'tokens',
+        'meta.chunks': 'chunks',
         'state.pending': 'pending',
         'state.error': 'error',
         'state.noBody': 'This request carried no body.',
         'state.noHeaders': 'No headers were recorded.',
         'state.noResponse': 'The response has not arrived yet.',
+        'state.noAssembled': 'This response carries no readable answer to assemble.',
+        'state.partial': 'assembly stopped early: the capture is incomplete',
+        'state.previewCut': 'the raw preview is cut here',
+        'headers.request': 'Request headers',
+        'headers.response': 'Response headers',
         'count.requests': 'requests',
       },
       ru: {
@@ -63,17 +80,30 @@ window.__ModuleLoader__.load({
         'action.copy': 'Копировать',
         'action.copied': 'Скопировано',
         'action.back': 'Назад',
-        'action.refresh': 'Обновить',
+        'action.prev': 'Предыдущее совпадение',
+        'action.next': 'Следующее совпадение',
         'filter.placeholder': 'Фильтр по URL, методу или заголовку',
+        'search.placeholder': 'Поиск по вкладке',
+        'search.none': 'Совпадений нет',
         'tab.request': 'JSON запроса',
         'tab.headers': 'Заголовки',
         'tab.curl': 'cURL',
         'tab.response': 'Ответ',
+        'view.assembled': 'Собранный',
+        'view.raw': 'Сырой поток',
+        'label.reasoning': 'Рассуждение',
+        'label.usage': 'токенов',
+        'meta.chunks': 'чанков',
         'state.pending': 'в процессе',
         'state.error': 'ошибка',
         'state.noBody': 'У этого запроса нет тела.',
         'state.noHeaders': 'Заголовки не записаны.',
         'state.noResponse': 'Ответ ещё не пришёл.',
+        'state.noAssembled': 'В этом ответе нет читаемого текста для сборки.',
+        'state.partial': 'сборка остановлена: перехват неполный',
+        'state.previewCut': 'сырое превью обрезано здесь',
+        'headers.request': 'Заголовки запроса',
+        'headers.response': 'Заголовки ответа',
         'count.requests': 'запросов',
       },
     }
@@ -128,6 +158,7 @@ window.__ModuleLoader__.load({
   outline: none;
 }
 .dsh-api-monitor__search:focus { border-color: var(--dsw-alias-brand-primary); }
+.dsh-api-monitor__search--narrow { flex: none; width: 180px; }
 .dsh-api-monitor__btn {
   display: inline-flex;
   align-items: center;
@@ -147,6 +178,37 @@ window.__ModuleLoader__.load({
 .dsh-api-monitor__btn--on {
   color: var(--dsw-alias-brand-primary);
   border-color: var(--dsw-alias-brand-primary);
+}
+.dsh-api-monitor__seg {
+  display: inline-flex;
+  border: 1px solid var(--dsw-alias-border-l1);
+  border-radius: 6px;
+  overflow: hidden;
+  flex: none;
+}
+.dsh-api-monitor__segbtn {
+  padding: 3px 8px;
+  font: inherit;
+  font-size: 11px;
+  color: var(--dsw-alias-label-secondary);
+  background: transparent;
+  border: 0;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.dsh-api-monitor__segbtn--active {
+  color: var(--dsw-alias-label-primary);
+  background: var(--dsw-alias-bg-layer-2);
+}
+.dsh-api-monitor__hit {
+  background: #ffe066;
+  color: #161616;
+  border-radius: 2px;
+  padding: 0 1px;
+}
+.dsh-api-monitor__hit--active {
+  background: #ffb020;
+  box-shadow: 0 0 0 2px rgba(255, 176, 32, .45);
 }
 .dsh-api-monitor__list { flex: 1; overflow-y: auto; min-height: 0; }
 .dsh-api-monitor__row {
@@ -215,8 +277,9 @@ window.__ModuleLoader__.load({
 }
 .dsh-api-monitor__tabs {
   display: flex;
+  align-items: center;
   gap: 2px;
-  padding: 6px 8px 0;
+  padding: 4px 8px 0;
   border-bottom: 1px solid var(--dsw-alias-border-l1);
   background: var(--dsw-alias-bg-layer-1);
   flex: none;
@@ -246,6 +309,7 @@ window.__ModuleLoader__.load({
   word-break: break-word;
   user-select: text;
 }
+.dsh-api-monitor__answer { line-height: 1.6; }
 .dsh-api-monitor__table { width: 100%; border-collapse: collapse; }
 .dsh-api-monitor__table td { padding: 4px 6px; border-bottom: 1px solid var(--dsw-alias-border-l1); vertical-align: top; }
 .dsh-api-monitor__table td:first-child {
@@ -256,6 +320,18 @@ window.__ModuleLoader__.load({
 }
 .dsh-api-monitor__table td:last-child { word-break: break-word; user-select: text; }
 .dsh-api-monitor__muted { color: var(--dsw-alias-label-secondary); }
+.dsh-api-monitor__details {
+  margin-top: 10px;
+  border: 1px solid var(--dsw-alias-border-l1);
+  border-radius: 6px;
+  padding: 6px 8px;
+}
+.dsh-api-monitor__details > summary {
+  cursor: pointer;
+  color: var(--dsw-alias-label-secondary);
+  font-size: 11px;
+  user-select: none;
+}
 .dsh-api-monitor__railbtn {
   display: inline-flex;
   align-items: center;
@@ -351,14 +427,220 @@ window.__ModuleLoader__.load({
       return String(record.responseStatus)
     }
 
+    /** The assembled view of a record, when the Host produced one with text. */
+    function assembledOf(record) {
+      const assembled = record.responseAssembled
+      if (!assembled || typeof assembled !== 'object') return null
+      const text = typeof assembled.text === 'string' ? assembled.text : ''
+      const reasoning = typeof assembled.reasoning === 'string' ? assembled.reasoning : ''
+      if (text === '' && reasoning === '') return null
+      return { ...assembled, text, reasoning }
+    }
+
+    /** Tokens summary from a usage object, whichever provider wrote it. */
+    function usageText(usage) {
+      if (!usage || typeof usage !== 'object') return ''
+      const prompt = usage.prompt_tokens ?? usage.input_tokens
+      const completion = usage.completion_tokens ?? usage.output_tokens
+      const total = usage.total_tokens
+      const parts = []
+      if (typeof prompt === 'number') parts.push(`in ${prompt}`)
+      if (typeof completion === 'number') parts.push(`out ${completion}`)
+      if (typeof total === 'number') parts.push(`total ${total}`)
+      return parts.join(' · ')
+    }
+
+    /** Count matches of `query` in one string, bounded by MAX_HITS. */
+    function countMatches(text, query) {
+      if (query === '') return 0
+      const haystack = text.toLowerCase()
+      const needle = query.toLowerCase()
+      let at = 0
+      let found = 0
+      while (found < MAX_HITS) {
+        const index = haystack.indexOf(needle, at)
+        if (index < 0) break
+        found += 1
+        at = index + needle.length
+      }
+      return found
+    }
+
+    /**
+     * Render one string with every match wrapped in a mark.
+     * @param text - the string to render.
+     * @param query - lower-case search text; empty renders the string as is.
+     * @param cursor - shared counter, so marks carry a tab-wide index.
+     * @param activeIndex - the mark to emphasize, or -1.
+     */
+    function marked(text, query, cursor, activeIndex) {
+      if (query === '' || text === '') return text
+      const haystack = text.toLowerCase()
+      const nodes = []
+      let at = 0
+      let local = 0
+      while (true) {
+        const index = haystack.indexOf(query, at)
+        if (index < 0) break
+        if (local >= MAX_HITS) break
+        if (index > at) nodes.push(text.slice(at, index))
+        const globalIndex = cursor.offset
+        cursor.offset += 1
+        nodes.push(h('mark', {
+          key: `hit-${globalIndex}`,
+          className: globalIndex === activeIndex
+            ? 'dsh-api-monitor__hit dsh-api-monitor__hit--active'
+            : 'dsh-api-monitor__hit',
+        }, text.slice(index, index + query.length)))
+        at = index + query.length
+        local += 1
+      }
+      if (nodes.length === 0) return text
+      if (at < text.length) nodes.push(text.slice(at))
+      return nodes
+    }
+
+    /** The strings a tab shows, in reading order: the search index and the renderer share them. */
+    function tabStrings(record, tab, view) {
+      if (tab === 'request') return [JSON.stringify(fullJson(record), null, 2)]
+      if (tab === 'curl') return [curlOf(record)]
+      if (tab === 'headers') {
+        const out = []
+        for (const [name, value] of Object.entries(record.headers || {})) out.push(name, String(value))
+        for (const [name, value] of Object.entries(record.responseHeaders || {})) out.push(name, String(value))
+        return out
+      }
+      if (view === 'raw') return [asText(record.responsePreview)]
+      const assembled = assembledOf(record)
+      if (assembled === null) return [asText(record.responsePreview)]
+      return assembled.reasoning === '' ? [assembled.text] : [assembled.text, assembled.reasoning]
+    }
+
+    /** The whole captured exchange as one JSON document. */
+    function fullJson(record) {
+      return {
+        id: record.id,
+        timestamp: record.timestamp,
+        method: record.method,
+        url: record.url,
+        headers: record.headers || {},
+        body: record.body === undefined ? null : record.body,
+        response: {
+          status: record.responseStatus,
+          statusText: record.responseStatusText,
+          durationMs: record.durationMs,
+          headers: record.responseHeaders || {},
+          body: record.responsePreview === undefined ? null : record.responsePreview,
+          bytes: record.responseBytes,
+          incomplete: record.responseIncomplete === true,
+          assembled: record.responseAssembled === undefined ? null : record.responseAssembled,
+        },
+        error: record.error === undefined ? null : record.error,
+      }
+    }
+
+    /** A two-column header table, or the empty notice. */
+    function headerTable(headers, t, query, cursor, activeIndex) {
+      const entries = Object.entries(headers || {})
+      if (entries.length === 0) return h('div', { className: 'dsh-api-monitor__muted' }, t('state.noHeaders'))
+      return h('table', { className: 'dsh-api-monitor__table' },
+        h('tbody', null, entries.map(([name, value]) =>
+          h('tr', { key: name },
+            h('td', null, marked(name, query, cursor, activeIndex)),
+            h('td', null, marked(String(value), query, cursor, activeIndex)),
+          ))),
+      )
+    }
+
+    /** The Response tab: the assembled answer, or the raw stream on request. */
+    function ResponsePane({ record, t, query, activeIndex, view, onChangeView, text, reasoning }) {
+      const cursor = { offset: 0 }
+
+      if (record.error) {
+        return h('pre', { className: 'dsh-api-monitor__code' }, marked(record.error, query, cursor, activeIndex))
+      }
+      if (record.pending || record.responseStatus === null || record.responseStatus === undefined) {
+        return h('div', { className: 'dsh-api-monitor__muted' }, t('state.noResponse'))
+      }
+
+      const assembled = assembledOf(record)
+      const effective = assembled === null ? 'raw' : view
+      const usage = assembled === null ? '' : usageText(assembled.usage)
+
+      return h('div', null,
+        h('div', {
+          className: 'dsh-api-monitor__bar',
+          style: { padding: '0 0 8px', background: 'transparent', flexWrap: 'wrap' },
+        },
+          h('div', { className: 'dsh-api-monitor__meta' },
+            h('span', null, `${record.responseStatus} ${record.responseStatusText || ''}`),
+            record.durationMs === null || record.durationMs === undefined ? null : h('span', null, `${record.durationMs} ms`),
+            assembled && assembled.model ? h('span', null, assembled.model) : null,
+            assembled && assembled.finishReason ? h('span', null, `finish: ${assembled.finishReason}`) : null,
+            usage === '' ? null : h('span', null, usage),
+            assembled && typeof assembled.frames === 'number'
+              ? h('span', null, `${assembled.frames} ${t('meta.chunks')}`)
+              : null,
+          ),
+          assembled === null ? null : h('div', { className: 'dsh-api-monitor__seg', style: { marginLeft: 'auto' } },
+            h('button', {
+              type: 'button',
+              className: `dsh-api-monitor__segbtn${effective === 'assembled' ? ' dsh-api-monitor__segbtn--active' : ''}`,
+              onClick: () => { onChangeView('assembled') },
+            }, t('view.assembled')),
+            h('button', {
+              type: 'button',
+              className: `dsh-api-monitor__segbtn${effective === 'raw' ? ' dsh-api-monitor__segbtn--active' : ''}`,
+              onClick: () => { onChangeView('raw') },
+            }, t('view.raw')),
+          ),
+        ),
+
+        assembled && record.responseIncomplete === true
+          ? h('div', { className: 'dsh-api-monitor__muted', style: { marginBottom: 6 } }, t('state.partial'))
+          : null,
+
+        effective === 'assembled' && assembled !== null
+          ? h('div', null,
+              h('pre', { className: 'dsh-api-monitor__code dsh-api-monitor__answer' },
+                marked(text, query, cursor, activeIndex)),
+              reasoning === ''
+                ? null
+                : h('details', { className: 'dsh-api-monitor__details' },
+                    h('summary', null, `${t('label.reasoning')} · ${reasoning.length}`),
+                    h('pre', { className: 'dsh-api-monitor__code' },
+                      marked(reasoning, query, cursor, activeIndex)),
+                  ),
+              assembled.toolCalls && assembled.toolCalls.length > 0
+                ? h('details', { className: 'dsh-api-monitor__details' },
+                    h('summary', null, `tool calls · ${assembled.toolCalls.length}`),
+                    h('pre', { className: 'dsh-api-monitor__code' }, JSON.stringify(assembled.toolCalls, null, 2)),
+                  )
+                : null,
+            )
+          : h('div', null,
+              h('pre', { className: 'dsh-api-monitor__code' },
+                marked(text, query, cursor, activeIndex)),
+              record.responsePreviewTruncated === true
+                ? h('div', { className: 'dsh-api-monitor__muted', style: { marginTop: 6 } },
+                    `${t('state.previewCut')} · ${record.responseBytes} B`)
+                : null,
+            ),
+      )
+    }
+
     /** The monitor body: a request list, and the selected request's detail. */
     function ApiMonitor({ t }) {
       const [requests, setRequests] = React.useState([])
       const [selectedId, setSelectedId] = React.useState(null)
       const [filter, setFilter] = React.useState('')
       const [tab, setTab] = React.useState('request')
+      const [query, setQuery] = React.useState('')
+      const [hitIndex, setHitIndex] = React.useState(0)
+      const [responseView, setResponseView] = React.useState('assembled')
       const [live, setLive] = React.useState(true)
       const [copied, setCopied] = React.useState(false)
+      const paneRef = React.useRef(null)
       const liveRef = React.useRef(true)
       liveRef.current = live
 
@@ -443,13 +725,13 @@ window.__ModuleLoader__.load({
       }
 
       const visible = React.useMemo(() => {
-        const query = filter.trim().toLowerCase()
-        if (query === '') return requests
+        const needle = filter.trim().toLowerCase()
+        if (needle === '') return requests
         return requests.filter((record) => {
-          if ((record.url || '').toLowerCase().includes(query)) return true
-          if ((record.method || '').toLowerCase().includes(query)) return true
+          if ((record.url || '').toLowerCase().includes(needle)) return true
+          if ((record.method || '').toLowerCase().includes(needle)) return true
           try {
-            return JSON.stringify(record.headers || {}).toLowerCase().includes(query)
+            return JSON.stringify(record.headers || {}).toLowerCase().includes(needle)
           } catch {
             return false
           }
@@ -458,26 +740,89 @@ window.__ModuleLoader__.load({
 
       const selected = selectedId === null ? undefined : requests.find(record => record.id === selectedId)
 
+      const needle = query.trim().toLowerCase()
+
+      const strings = React.useMemo(
+        () => (selected === undefined ? [] : tabStrings(selected, tab, responseView)),
+        [selected, tab, responseView],
+      )
+
+      const hits = React.useMemo(() => {
+        if (needle === '') return 0
+        let total = 0
+        for (const text of strings) total += countMatches(text, needle)
+        return total
+      }, [strings, needle])
+
+      // A new search, tab, or record restarts from the first hit.
+      React.useEffect(() => { setHitIndex(0) }, [needle, tab, selectedId, responseView])
+
+      // A record without an assembled answer can only show its raw stream.
+      React.useEffect(() => {
+        if (selected === undefined) return
+        setResponseView(assembledOf(selected) === null ? 'raw' : 'assembled')
+      }, [selectedId])
+
+      React.useEffect(() => {
+        if (needle === '' || hits === 0) return
+        const pane = paneRef.current
+        if (!pane || typeof pane.querySelector !== 'function') return
+        const active = pane.querySelector('.dsh-api-monitor__hit--active')
+        if (active && typeof active.scrollIntoView === 'function') {
+          active.scrollIntoView({ block: 'center' })
+        }
+      }, [hitIndex, hits, needle, tab])
+
+      const move = (step) => {
+        if (hits === 0) return
+        setHitIndex(current => ((current + step) % hits + hits) % hits)
+      }
+
       const copyActive = () => {
         if (!selected) return
-        let text = ''
-        if (tab === 'request') text = JSON.stringify(fullJson(selected), null, 2)
-        else if (tab === 'headers') text = JSON.stringify(selected.headers || {}, null, 2)
-        else if (tab === 'curl') text = curlOf(selected)
-        else text = asText(selected.responsePreview)
-        copyText(text)
+        copyText((strings.length > 0 ? strings : tabStrings(selected, tab, responseView)).join('\n\n'))
         setCopied(true)
         setTimeout(() => { setCopied(false) }, 1200)
       }
 
       if (selected) {
+        const cursor = { offset: 0 }
+        const activeIndex = needle === '' || hits === 0 ? -1 : Math.min(hitIndex, hits - 1)
+
         return h('div', { className: 'dsh-api-monitor' },
           h('div', { className: 'dsh-api-monitor__bar' },
             h('button', {
               type: 'button', className: 'dsh-api-monitor__btn dsh-api-monitor__btn--ghost',
-              onClick: () => { setSelectedId(null) },
+              onClick: () => { setSelectedId(null); setQuery('') },
             }, '← ', t('action.back')),
             h('span', { className: 'dsh-api-monitor__count dsh-api-monitor__grow' }, selected.method),
+            h('input', {
+              className: 'dsh-api-monitor__search dsh-api-monitor__search--narrow',
+              placeholder: t('search.placeholder'),
+              value: query,
+              onChange: (event) => { setQuery(event.target.value) },
+              onKeyDown: (event) => {
+                if (event.key === 'Enter') {
+                  event.preventDefault()
+                  move(event.shiftKey ? -1 : 1)
+                }
+                if (event.key === 'Escape') { setQuery('') }
+              },
+            }),
+            needle === ''
+              ? null
+              : h('span', { className: 'dsh-api-monitor__count' },
+                  hits === 0 ? t('search.none') : `${activeIndex + 1}/${hits}`),
+            h('button', {
+              type: 'button', className: 'dsh-api-monitor__btn dsh-api-monitor__btn--ghost',
+              title: t('action.prev'), 'aria-label': t('action.prev'),
+              disabled: hits === 0, onClick: () => { move(-1) },
+            }, '‹'),
+            h('button', {
+              type: 'button', className: 'dsh-api-monitor__btn dsh-api-monitor__btn--ghost',
+              title: t('action.next'), 'aria-label': t('action.next'),
+              disabled: hits === 0, onClick: () => { move(1) },
+            }, '›'),
           ),
           h('div', { className: 'dsh-api-monitor__bar dsh-api-monitor__bar--stack' },
             h('div', { className: 'dsh-api-monitor__url dsh-api-monitor__grow', title: selected.url }, selected.url),
@@ -491,12 +836,27 @@ window.__ModuleLoader__.load({
                 onClick: () => { setTab(key) },
               }, text)),
           ),
-          h('div', { className: 'dsh-api-monitor__pane' },
+          h('div', { className: 'dsh-api-monitor__pane', ref: paneRef },
             tab === 'request' && h('pre', { className: 'dsh-api-monitor__code' },
-              JSON.stringify(fullJson(selected), null, 2)),
-            tab === 'headers' && headerTable(selected.headers, t),
-            tab === 'curl' && h('pre', { className: 'dsh-api-monitor__code' }, curlOf(selected)),
-            tab === 'response' && responsePane(selected, t),
+              marked(strings[0] ?? '', needle, cursor, activeIndex)),
+            tab === 'headers' && h('div', null,
+              h('div', { className: 'dsh-api-monitor__muted', style: { marginBottom: 6 } }, t('headers.request')),
+              headerTable(selected.headers, t, needle, cursor, activeIndex),
+              h('div', { className: 'dsh-api-monitor__muted', style: { margin: '12px 0 6px' } }, t('headers.response')),
+              headerTable(selected.responseHeaders, t, needle, cursor, activeIndex),
+            ),
+            tab === 'curl' && h('pre', { className: 'dsh-api-monitor__code' },
+              marked(strings[0] ?? '', needle, cursor, activeIndex)),
+            tab === 'response' && h(ResponsePane, {
+              record: selected,
+              t,
+              query: needle,
+              activeIndex,
+              view: responseView,
+              onChangeView: setResponseView,
+              text: strings[0] ?? '',
+              reasoning: strings[1] ?? '',
+            }),
           ),
           h('div', { className: 'dsh-api-monitor__bar' },
             h('span', { className: 'dsh-api-monitor__count dsh-api-monitor__grow' },
@@ -544,7 +904,7 @@ window.__ModuleLoader__.load({
                 key: record.id,
                 type: 'button',
                 className: 'dsh-api-monitor__row',
-                onClick: () => { setSelectedId(record.id); setTab('request') },
+                onClick: () => { setSelectedId(record.id); setTab('response'); setQuery('') },
               },
                 h('div', { className: 'dsh-api-monitor__rowline' },
                   h('span', { className: 'dsh-api-monitor__method' }, record.method),
@@ -558,59 +918,6 @@ window.__ModuleLoader__.load({
                 ),
               )),
             ),
-      )
-    }
-
-    /** The whole captured exchange as one JSON document. */
-    function fullJson(record) {
-      return {
-        id: record.id,
-        timestamp: record.timestamp,
-        method: record.method,
-        url: record.url,
-        headers: record.headers || {},
-        body: record.body === undefined ? null : record.body,
-        response: {
-          status: record.responseStatus,
-          statusText: record.responseStatusText,
-          durationMs: record.durationMs,
-          headers: record.responseHeaders || {},
-          body: record.responsePreview === undefined ? null : record.responsePreview,
-          bytes: record.responseBytes,
-        },
-        error: record.error === undefined ? null : record.error,
-      }
-    }
-
-    /** A two-column header table, or the empty notice. */
-    function headerTable(headers, t) {
-      const entries = Object.entries(headers || {})
-      if (entries.length === 0) return h('div', { className: 'dsh-api-monitor__muted' }, t('state.noHeaders'))
-      return h('table', { className: 'dsh-api-monitor__table' },
-        h('tbody', null, entries.map(([name, value]) =>
-          h('tr', { key: name },
-            h('td', null, name),
-            h('td', null, String(value)),
-          ))),
-      )
-    }
-
-    /** The response pane: status, timing, headers, then the captured body. */
-    function responsePane(record, t) {
-      if (record.error) {
-        return h('pre', { className: 'dsh-api-monitor__code' }, record.error)
-      }
-      if (record.pending || record.responseStatus === null || record.responseStatus === undefined) {
-        return h('div', { className: 'dsh-api-monitor__muted' }, t('state.noResponse'))
-      }
-      return h('div', null,
-        h('div', { className: 'dsh-api-monitor__meta', style: { marginBottom: 8 } },
-          h('span', null, `${record.responseStatus} ${record.responseStatusText || ''}`),
-          h('span', null, record.durationMs === null || record.durationMs === undefined ? '' : `${record.durationMs} ms`),
-        ),
-        headerTable(record.responseHeaders, t),
-        h('pre', { className: 'dsh-api-monitor__code', style: { marginTop: 10 } },
-          asText(record.responsePreview) || ''),
       )
     }
 

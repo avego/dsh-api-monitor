@@ -23,8 +23,15 @@ export const inject = ['webServer'];
 
 /** Per-body safety cap, well above a real chat request. */
 const MAX_BODY_CHARS = 8 * 1024 * 1024;
-/** How much of a response body is captured for the preview. */
-const MAX_PREVIEW_BYTES = 64 * 1024;
+/** How much of a response body is kept as the raw preview shown in the UI. */
+const MAX_PREVIEW_BYTES = 256 * 1024;
+/**
+ * How much raw response text is read for assembly. Assembly needs the whole
+ * stream up to `[DONE]`, which is much larger than the preview shows.
+ */
+const MAX_STREAM_BYTES = 4 * 1024 * 1024;
+/** Ceiling for the assembled answer, so one response cannot dominate memory. */
+const MAX_ASSEMBLED_CHARS = 2 * 1024 * 1024;
 /** Default ceiling for the whole in-memory buffer, in characters. */
 const DEFAULT_MAX_TOTAL_CHARS = 48 * 1024 * 1024;
 /** Marks a patched module entry point so a reload never double-wraps. */
@@ -133,6 +140,248 @@ function hostOf(url) {
   }
 }
 
+// -------------------------------------------------------------------------
+// Response assembly.
+//
+// Streaming providers answer with an event stream in which the answer arrives
+// as many small deltas. Reading that raw is close to useless, so the Host
+// folds the deltas back into the answer the model actually produced, for the
+// three wire shapes DSH meets: OpenAI-compatible/Gemini-over-proxy chat chunks, Gemini's
+// native candidates, and Anthropic-style typed events. A non-stream JSON body
+// is read directly.
+// -------------------------------------------------------------------------
+
+/** A string field, or `undefined`; keeps the assembly tolerant of odd payloads. */
+function textAt(value) {
+  return typeof value === 'string' && value !== '' ? value : undefined;
+}
+
+/** Map a Gemini `usageMetadata` object onto the OpenAI-style usage fields. */
+function geminiUsage(meta) {
+  if (!meta || typeof meta !== 'object') return undefined;
+  const usage = {};
+  if (Number.isFinite(meta.promptTokenCount)) usage.prompt_tokens = meta.promptTokenCount;
+  if (Number.isFinite(meta.candidatesTokenCount)) usage.completion_tokens = meta.candidatesTokenCount;
+  if (Number.isFinite(meta.totalTokenCount)) usage.total_tokens = meta.totalTokenCount;
+  if (Number.isFinite(meta.cachedContentTokenCount)) usage.cached_tokens = meta.cachedContentTokenCount;
+  if (Number.isFinite(meta.thoughtsTokenCount)) usage.reasoning_tokens = meta.thoughtsTokenCount;
+  return Object.keys(usage).length > 0 ? usage : undefined;
+}
+
+/** Read a complete (non-streamed) response body into the same assembled shape. */
+function assembleWholeJson(json) {
+  if (!json || typeof json !== 'object') return null;
+
+  let text = '';
+  let reasoning = '';
+
+  if (Array.isArray(json.choices)) {
+    for (const choice of json.choices) {
+      const message = choice && (choice.message || choice.delta) ? (choice.message || choice.delta) : {};
+      if (typeof message.content === 'string') text += message.content;
+      else if (Array.isArray(message.content)) {
+        for (const part of message.content) {
+          if (typeof part === 'string') text += part;
+          else if (part && typeof part.text === 'string') text += part.text;
+        }
+      }
+      if (typeof message.reasoning_content === 'string') reasoning += message.reasoning_content;
+      else if (typeof message.reasoning === 'string') reasoning += message.reasoning;
+      if (typeof choice.text === 'string') text += choice.text;
+    }
+  }
+
+  if (Array.isArray(json.candidates)) {
+    for (const candidate of json.candidates) {
+      const parts = candidate && candidate.content && Array.isArray(candidate.content.parts) ? candidate.content.parts : [];
+      for (const part of parts) {
+        if (part && typeof part.text === 'string') text += part.text;
+      }
+    }
+    reasoning = reasoning || '';
+  }
+
+  if (typeof json.output_text === 'string') text += json.output_text;
+  if (typeof json.text === 'string' && text === '') text += json.text;
+
+  if (text === '' && reasoning === '') return null;
+
+  return {
+    text,
+    reasoning: reasoning === '' ? null : reasoning,
+    model: textAt(json.model) ?? null,
+    finishReason: textAt(json.choices?.[0]?.finish_reason) ?? textAt(json.candidates?.[0]?.finishReason) ?? null,
+    usage: json.usage && typeof json.usage === 'object' ? json.usage : (geminiUsage(json.usageMetadata) ?? null),
+    toolCalls: [],
+    frames: 1,
+    done: true,
+  };
+}
+
+/**
+ * Fold an SSE response into the answer it carries.
+ * @param {string} body - the raw stream text.
+ * @returns {{text: string, reasoning: string | null, model: string | null, finishReason: string | null, usage: object | null, toolCalls: Array<object>, frames: number, done: boolean, error: string | null}}
+ */
+function assembleSse(body) {
+  let text = '';
+  let reasoning = '';
+  let model = null;
+  let finishReason = null;
+  let usage = null;
+  let error = null;
+  let done = false;
+  let frames = 0;
+  let eventType = null;
+  /** Tool calls arrive in pieces keyed by index; keep them in that order. */
+  const tools = [];
+
+  const mergeTool = (call) => {
+    if (!call || typeof call !== 'object') return;
+    const index = Number.isInteger(call.index) ? call.index : tools.length;
+    const current = tools[index] ?? { name: null, arguments: '' };
+    if (call.function && typeof call.function.name === 'string' && call.function.name !== '') current.name = call.function.name;
+    if (call.function && typeof call.function.arguments === 'string') current.arguments += call.function.arguments;
+    if (current.name === null && typeof call.name === 'string') current.name = call.name;
+    tools[index] = current;
+  };
+
+  for (const line of body.split(/\r?\n/u)) {
+    if (line.startsWith('event:')) {
+      eventType = line.slice(6).trim();
+      continue;
+    }
+    if (!line.startsWith('data:')) continue;
+
+    const payload = line.slice(5).trim();
+    if (payload === '') continue;
+    if (payload === '[DONE]') {
+      done = true;
+      continue;
+    }
+
+    let json;
+    try {
+      json = JSON.parse(payload);
+    } catch {
+      continue;
+    }
+    if (!json || typeof json !== 'object') continue;
+    frames += 1;
+
+    model = model ?? textAt(json.model) ?? textAt(json.response?.model) ?? null;
+
+    if (Array.isArray(json.choices)) {
+      for (const choice of json.choices) {
+        if (!choice || typeof choice !== 'object') continue;
+        const delta = choice.delta ?? choice.message ?? {};
+        if (typeof delta.content === 'string') text += delta.content;
+        else if (Array.isArray(delta.content)) {
+          for (const part of delta.content) {
+            if (typeof part === 'string') text += part;
+            else if (part && typeof part.text === 'string') text += part.text;
+          }
+        }
+        if (typeof delta.reasoning_content === 'string') reasoning += delta.reasoning_content;
+        else if (typeof delta.reasoning === 'string') reasoning += delta.reasoning;
+        if (Array.isArray(delta.tool_calls)) for (const call of delta.tool_calls) mergeTool(call);
+        if (typeof choice.text === 'string') text += choice.text;
+        if (typeof choice.finish_reason === 'string' && choice.finish_reason !== '') finishReason = choice.finish_reason;
+      }
+    }
+
+    if (Array.isArray(json.candidates)) {
+      for (const candidate of json.candidates) {
+        if (!candidate || typeof candidate !== 'object') continue;
+        const parts = candidate.content && Array.isArray(candidate.content.parts) ? candidate.content.parts : [];
+        for (const part of parts) {
+          if (part && typeof part.text === 'string') text += part.text;
+        }
+        if (typeof candidate.finishReason === 'string' && candidate.finishReason !== '') finishReason = candidate.finishReason;
+      }
+    }
+    const gemini = geminiUsage(json.usageMetadata);
+    if (gemini !== undefined) usage = { ...(usage ?? {}), ...gemini };
+
+    // Anthropic-style typed events: the event name may be on its own line.
+    const type = textAt(json.type) ?? eventType ?? null;
+    if (type === 'content_block_delta' && json.delta && typeof json.delta === 'object') {
+      if (json.delta.type === 'thinking_delta' && typeof json.delta.thinking === 'string') reasoning += json.delta.thinking;
+      else if (typeof json.delta.text === 'string') text += json.delta.text;
+    }
+    if (type === 'content_block_start' && json.content_block && json.content_block.type === 'tool_use') {
+      tools.push({ name: textAt(json.content_block.name) ?? null, arguments: '' });
+    }
+    if (type === 'message_delta') {
+      if (json.delta && typeof json.delta.stop_reason === 'string' && json.delta.stop_reason !== '') {
+        finishReason = json.delta.stop_reason;
+      }
+      if (json.usage && typeof json.usage === 'object') usage = { ...(usage ?? {}), ...json.usage };
+    }
+    if (type === 'message_start' && json.message) {
+      model = model ?? textAt(json.message.model) ?? null;
+      if (json.message.usage && typeof json.message.usage === 'object') usage = { ...(json.message.usage), ...(usage ?? {}) };
+    }
+
+    // Responses-API event vocabulary.
+    if (type === 'response.output_text.delta' && typeof json.delta === 'string') text += json.delta;
+    if (type === 'response.reasoning_text.delta' && typeof json.delta === 'string') reasoning += json.delta;
+    if (type === 'response.completed' && json.response && typeof json.response === 'object') {
+      if (json.response.usage && typeof json.response.usage === 'object') usage = json.response.usage;
+      finishReason = finishReason ?? textAt(json.response.status) ?? null;
+    }
+
+    if (json.usage && typeof json.usage === 'object' && typeof json.usage.total_tokens === 'number') usage = json.usage;
+    if (json.error) {
+      const message = typeof json.error === 'string' ? json.error : textAt(json.error.message);
+      if (message) error = message;
+    }
+  }
+
+  return {
+    text,
+    reasoning: reasoning === '' ? null : reasoning,
+    model,
+    finishReason,
+    usage,
+    toolCalls: tools.filter(call => call !== undefined && call !== null && (call.name !== null || call.arguments !== '')),
+    frames,
+    done,
+    error,
+  };
+}
+
+/**
+ * Build the assembled view of a response body, or `null` when the body carries
+ * no readable answer (a binary, an empty stream, an error page).
+ * Exported so it can be exercised against a captured stream without a live Host.
+ * @param {string} body - raw response text.
+ * @param {boolean} incomplete - whether the capture itself was truncated.
+ */
+export function assembleResponse(body, incomplete) {
+  const trimmed = body.trim();
+  if (trimmed === '') return null;
+
+  const streamed = /(?:^|\n)data:/u.test(trimmed);
+
+  if (!streamed) {
+    try {
+      const json = JSON.parse(trimmed);
+      const flat = assembleWholeJson(json);
+      if (flat === null) return null;
+      return { kind: 'json', incomplete, ...flat, text: flat.text.slice(0, MAX_ASSEMBLED_CHARS) };
+    } catch {
+      return null;
+    }
+  }
+
+  const flat = assembleSse(trimmed);
+  if (flat.text === '' && flat.reasoning === null && flat.toolCalls.length === 0) {
+    return flat.done || flat.error ? { kind: 'sse', incomplete, ...flat } : null;
+  }
+  return { kind: 'sse', incomplete, ...flat, text: flat.text.slice(0, MAX_ASSEMBLED_CHARS) };
+}
+
 export function apply(ctx, config = {}) {
   const maxEntries = Number.isFinite(config.maxEntries) && config.maxEntries > 0
     ? Math.min(Math.floor(config.maxEntries), 2000)
@@ -157,6 +406,11 @@ export function apply(ctx, config = {}) {
     }
     try {
       weight += JSON.stringify(record.responsePreview ?? null).length;
+    } catch {
+      /* same */
+    }
+    try {
+      weight += JSON.stringify(record.responseAssembled ?? null).length;
     } catch {
       /* same */
     }
@@ -254,14 +508,22 @@ export function apply(ctx, config = {}) {
       responseStatusText: null,
       responseHeaders: null,
       responsePreview: null,
+      responseAssembled: null,
       responseBytes: null,
+      responseIncomplete: false,
+      responsePreviewTruncated: false,
       error: null,
     };
     add(record);
     return record;
   };
 
-  /** Read at most MAX_PREVIEW_BYTES from a cloned response, then cancel it. */
+  /**
+   * Read the cloned response to its end (bounded by MAX_STREAM_BYTES), then
+   * publish two derived views: the raw preview the UI shows, and the assembled
+   * answer folded out of the stream. The reader is cancelled once the budget is
+   * spent, so a huge or endless body cannot hold the clone open.
+   */
   const previewResponse = async (response, id) => {
     if (typeof response.clone !== 'function') return;
     let clone;
@@ -272,10 +534,17 @@ export function apply(ctx, config = {}) {
     }
 
     const reader = clone.body && typeof clone.body.getReader === 'function' ? clone.body.getReader() : null;
+
     if (!reader) {
       try {
         const text = await clone.text();
-        update(id, { responsePreview: parseText(text), responseBytes: text.length });
+        update(id, {
+          responsePreview: parseText(text.slice(0, MAX_PREVIEW_BYTES)),
+          responseBytes: text.length,
+          responseIncomplete: false,
+          responsePreviewTruncated: text.length > MAX_PREVIEW_BYTES,
+          responseAssembled: assembleResponse(text, false),
+        });
       } catch {
         /* the preview is optional */
       }
@@ -284,6 +553,7 @@ export function apply(ctx, config = {}) {
 
     const chunks = [];
     let total = 0;
+    let incomplete = false;
     try {
       for (;;) {
         const { done, value } = await reader.read();
@@ -292,10 +562,14 @@ export function apply(ctx, config = {}) {
           chunks.push(value);
           total += value.byteLength;
         }
-        if (total >= MAX_PREVIEW_BYTES) break;
+        if (total >= MAX_STREAM_BYTES) {
+          incomplete = true;
+          break;
+        }
       }
     } catch {
-      /* streams can fail after the head arrived */
+      /* streams can fail after the head arrived; keep what was read */
+      incomplete = true;
     }
     try {
       await reader.cancel();
@@ -304,21 +578,23 @@ export function apply(ctx, config = {}) {
     }
 
     if (total === 0) return;
-    const bytes = new Uint8Array(total);
-    let offset = 0;
-    for (const chunk of chunks) {
-      bytes.set(chunk, offset);
-      offset += chunk.byteLength;
-    }
+
+    // Decode incrementally so a multi-byte character split across chunks survives.
+    const decoder = new TextDecoder('utf-8');
     let text = '';
     try {
-      text = new TextDecoder('utf-8').decode(bytes);
+      for (const chunk of chunks) text += decoder.decode(chunk, { stream: true });
+      text += decoder.decode();
     } catch {
       text = '[binary response]';
     }
+
     update(id, {
-      responsePreview: parseText(text),
-      responseBytes: total >= MAX_PREVIEW_BYTES ? `>=${total}` : total,
+      responsePreview: parseText(text.slice(0, MAX_PREVIEW_BYTES)),
+      responseBytes: total,
+      responseIncomplete: incomplete,
+      responsePreviewTruncated: text.length > MAX_PREVIEW_BYTES,
+      responseAssembled: assembleResponse(text, incomplete),
     });
   };
 

@@ -1,0 +1,5 @@
+- insert:
+    - id: api-monitor
+      name: '@local/dsh-api-monitor'
+      config:
+        maxEntries: 100

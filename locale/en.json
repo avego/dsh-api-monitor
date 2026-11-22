@@ -1,0 +1,7 @@
+{
+  "meta": {
+    "title": "Api monitor",
+    "description": "Inspects every outbound API request with its full headers and JSON body, from a right-Sidebar tab.",
+    "detail": "docs/DETAIL.md"
+  }
+}
